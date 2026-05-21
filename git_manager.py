@@ -72,7 +72,7 @@ def commit_and_push_episode(
     episode_date: str,
 ) -> None:
     """
-    暂存音频和RSS文件，提交并推送到 main 分支。
+    暂存音频、RSS和摘要存档，提交并推送到 main 分支。
     
     Args:
         repo: GitPython Repo 对象
@@ -89,10 +89,28 @@ def commit_and_push_episode(
     audio_rel = os.path.relpath(audio_path, repo_root)
     rss_rel = os.path.relpath(rss_path, repo_root)
     
-    logger.info(f"Staging: {audio_rel}, {rss_rel}")
+    # 摘要存档路径
+    data_dir = repo_root / "data"
+    summaries_file = data_dir / f"summaries_{episode_date}.json"
+    archive_file = data_dir / "reports_archive" / f"reports_{episode_date}.json"
+    
+    files_to_add = [audio_rel, rss_rel]
+    file_labels = [audio_rel, rss_rel]
+    
+    if summaries_file.exists():
+        summaries_rel = os.path.relpath(str(summaries_file), repo_root)
+        files_to_add.append(summaries_rel)
+        file_labels.append(summaries_rel)
+    
+    if archive_file.exists():
+        archive_rel = os.path.relpath(str(archive_file), repo_root)
+        files_to_add.append(archive_rel)
+        file_labels.append(archive_rel)
+    
+    logger.info(f"Staging: {', '.join(file_labels)}")
     
     # 暂存
-    repo.index.add([audio_rel, rss_rel])
+    repo.index.add(files_to_add)
     
     # 提交
     commit_msg = f"Episode {episode_date} - 大宗商品研究周报"
