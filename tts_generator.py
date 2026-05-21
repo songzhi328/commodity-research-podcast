@@ -23,6 +23,9 @@ def build_episode_script(summaries: dict) -> str:
     """
     从摘要 JSON 构建完整播客脚本。
     
+    每篇研报先报：名称、发布机构、发布日期，再读摘要。
+    不删减摘要内容。
+    
     Args:
         summaries: 包含 categories 键的摘要字典
         
@@ -39,14 +42,25 @@ def build_episode_script(summaries: dict) -> str:
     for cat_key in CATEGORIES:
         cat_data = categories.get(cat_key, {})
         if not cat_data:
-            continue  # 跳过空品类
+            continue
         
         header = cat_data.get("header", CATEGORIES[cat_key]["header"])
-        section_summary = cat_data.get("section_summary", "")
+        parts.append(f"\n{header}。\n")
         
-        parts.append(f"## {header}\n")
-        parts.append(section_summary)
-        parts.append("\n")
+        reports = cat_data.get("reports", [])
+        for i, report in enumerate(reports, 1):
+            title = report.get("title", "")
+            source = report.get("source", "")
+            date = report.get("date", "")
+            summary = report.get("summary", "")
+            
+            # 先报研报信息：名称、机构、日期
+            parts.append(
+                f"第{i}篇。{title}。{source}，{date}发布。\n"
+            )
+            # 再读摘要（原文，不删减）
+            parts.append(summary)
+            parts.append("\n")
     
     parts.append(EPISODE_OUTRO)
     
