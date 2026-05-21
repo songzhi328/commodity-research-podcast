@@ -62,6 +62,83 @@ def find_latest_summaries(data_dir: Path) -> dict:
         return json.load(f)
 
 
+def load_processed_reports(data_dir: Path) -> dict:
+    """加载已处理研报跟踪文件"""
+    processed_file = data_dir / "processed_reports.json"
+    if not processed_file.exists():
+        return {"titles": [], "urls": []}
+    with open(processed_file, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def dedup_summaries(summaries: dict, processed: dict) -> tuple:
+    """
+    对照已处理记录，过滤重复研报。
+    
+    Returns:
+        (去重后的 summaries, 跳过的研报列表)
+    """
+    skipped = []
+    for cat_key in list(summaries.get("categories", {}).keys()):
+        cat_data = summaries["categories"].get(cat_key, {})
+        reports = cat_data.get("reports", [])
+        new_reports = []
+        
+        for r in reports:
+            title = r.get("title", "")
+            url = r.get("url", "")
+            is_dup = False
+            reason = ""
+            
+            # 按标题去重（精确匹配或高相似度）
+            for p_title in processed.get("titles", []):
+                if title == p_title or title[:20] in p_title or p_title[:20] in title:
+                    is_dup = True
+                    reason = f"标题重复: {title[:50]}"
+                    break
+            
+            # 按URL去重
+            if not is_dup and url and url not in ("#", "无链接"):
+                if url in processed.get("urls", []):
+                    is_dup = True
+                    reason = f"URL重复: {url[:60]}"
+            
+            if is_dup:
+                skipped.append({"title": title, "reason": reason})
+                logger.info(f"  跳过重复: {reason}")
+            else:
+                new_reports.append(r)
+        
+        if new_reports:
+            summaries["categories"][cat_key]["reports"] = new_reports
+        elif reports and not new_reports:
+            logger.warning(f"  {cat_key}: 全部重复，保留原数据")
+    
+    return summaries, skipped
+
+
+def _update_processed_reports(summaries: dict, data_dir: Path) -> None:
+    """更新已处理研报跟踪文件"""
+    processed_file = data_dir / "processed_reports.json"
+    processed = load_processed_reports(data_dir)
+    
+    for cat_data in summaries.get("categories", {}).values():
+        for r in cat_data.get("reports", []):
+            title = r.get("title", "")
+            url = r.get("url", "")
+            if title and title not in processed["titles"]:
+                processed["titles"].append(title)
+            if url and url not in ("#", "无链接", "") and url not in processed.get("urls", []):
+                processed["urls"].append(url)
+    
+    processed["last_updated"] = datetime.now().strftime("%Y-%m-%d")
+    
+    with open(processed_file, "w", encoding="utf-8") as f:
+        json.dump(processed, f, ensure_ascii=False, indent=2)
+    
+    logger.info(f"Updated processed_reports: {len(processed['titles'])} titles, {len(processed['urls'])} URLs")
+
+
 def build_html_description(summaries: dict) -> str:
     """从摘要构建播客单集 HTML 描述"""
     parts = ["<p>本周大宗商品研究报告摘要：</p>"]
@@ -140,6 +217,13 @@ def main(date_override: str = None, summaries_path: str = None):
         logger.error("Expected file: data/summaries_YYYY-MM-DD.json")
         sys.exit(1)
     
+    # ---- Step 1.5: 去重检查 ----
+    logger.info("Step 1.5/4: Deduplicating against processed reports...")
+    processed = load_processed_reports(Path(config.DATA_DIR))
+    summaries, skipped = dedup_summaries(summaries, processed)
+    if skipped:
+        logger.warning(f"Skipped {len(skipped)} duplicate reports")
+    
     # ---- Step 2: 同步 Git Repo ----
     logger.info("Step 2/4: Syncing GitHub repository...")
     
@@ -204,6 +288,13 @@ def main(date_override: str = None, summaries_path: str = None):
     except Exception as e:
         logger.error(f"Git push failed: {e}")
         sys.exit(1)
+    
+    # ---- Step 5: 更新已处理记录 ----
+    try:
+        _update_processed_reports(summaries, Path(config.DATA_DIR))
+        logger.info("Updated processed_reports.json")
+    except Exception as e:
+        logger.warning(f"Failed to update processed_reports: {e}")
     
     # ---- 完成 ----
     elapsed = (datetime.now() - start_time).total_seconds()
