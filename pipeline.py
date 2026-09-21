@@ -167,11 +167,12 @@ def build_html_description(summaries: dict) -> str:
 
 
 def format_pub_date(date_str: str) -> str:
-    """将 YYYY-MM-DD 转为 RFC 2822 格式"""
-    # 使用北京时间 21:30（自动化运行时间）
-    dt = datetime.strptime(date_str, "%Y-%m-%d")
-    dt = dt.replace(hour=21, minute=30, second=0, tzinfo=timezone(timedelta(hours=8)))
-    # RFC 2822 格式
+    """转为 RFC 2822 格式，取实际推送时刻（北京时间）。
+
+    此前硬编码为运行日 21:30，手动补跑（如上午）会生成未来时间，
+    小宇宙等客户端把 pubDate 在未来的条目当作未到发布时间而不展示。
+    """
+    dt = datetime.now(timezone(timedelta(hours=8)))
     return dt.strftime("%a, %d %b %Y %H:%M:%S +0800")
 
 
