@@ -1,0 +1,567 @@
+#!/usr/bin/env python3
+"""
+Commodity Research API Researcher
+==================================
+替代 claude -p，用永不过期的 API Key 方案：
+  Step A: 火山引擎豆包搜索 → 5 板块研报检索
+  Step B: 火山方舟 GLM API → 生成 800-1000 字摘要 + 播客脚本 JSON
+  Step C: JSON 提取、修复与保存
+"""
+
+import os
+import sys
+import json
+import time
+import httpx
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# ============================================================
+# 常量
+# ============================================================
+PROJECT_DIR = "/DouDouBa/WorkBuddy/commodity-podcast"
+DATA_DIR = os.path.join(PROJECT_DIR, "data")
+ARCHIVE_DIR = os.path.join(DATA_DIR, "reports_archive")
+
+SEARCH_API_URL = "https://open.feedcoopapi.com/search_api/web_search"
+SEARCH_TRAFFIC_TAG = "skill_web_search_common"
+ARK_API_URL = "https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions"
+ARK_MODEL = "glm-5.3-flash"
+
+CATEGORIES = {
+    "coal": {
+        "header": "煤炭板块",
+        "queries": [
+            "动力煤 焦煤 焦炭 券商研报 周报",
+            "煤炭行业 最新研报 中金 东方财富 紫金资产",
+            "动力煤价格 焦煤供需 煤矿开工率 研报分析",
+        ],
+    },
+    "oil": {
+        "header": "石油原油板块",
+        "queries": [
+            "布伦特 WTI 原油 券商研报 周报",
+            "石油行业 最新研报 中金 东方财富",
+            "原油价格 供需分析 炼化 研报",
+        ],
+    },
+    "nonferrous": {
+        "header": "有色金属板块",
+        "queries": [
+            "铜 铝 锌 有色金属 券商研报 周报",
+            "有色金属行业 最新研报 中金 紫金矿业",
+            "铜价 铝价 供需 库存 研报分析",
+        ],
+    },
+    "agriculture": {
+        "header": "农产品板块",
+        "queries": [
+            "大豆 玉米 棕榈油 农产品 券商研报",
+            "农产品行业 最新研报 中金 东方财富",
+            "大豆价格 玉米供需 棕榈油走势 研报分析",
+        ],
+    },
+    "precious": {
+        "header": "贵金属板块",
+        "queries": [
+            "黄金 白银 贵金属 券商研报 周报",
+            "贵金属行业 最新研报 中金 东方财富",
+            "黄金价格 白银走势 央行购金 研报分析",
+        ],
+    },
+}
+
+
+def log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}")
+
+
+# ============================================================
+# Step A: 火山引擎豆包搜索
+# ============================================================
+
+def search_web(query, api_key, count=5, time_range="OneMonth"):
+    """调用火山引擎豆包搜索 API，返回结构化结果列表。"""
+    headers = {
+        "Content-Type": "application/json",
+        "X-Traffic-Tag": SEARCH_TRAFFIC_TAG,
+        "Authorization": f"Bearer {api_key}",
+    }
+    body = {
+        "Query": query,
+        "SearchType": "web",
+        "Count": count,
+        "NeedSummary": True,
+        "TimeRange": time_range,
+    }
+
+    try:
+        r = httpx.post(SEARCH_API_URL, json=body, headers=headers, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+
+        error = (data.get("ResponseMetadata") or {}).get("Error")
+        if error:
+            log(f"  Search API error [{error.get('Code')}]: {error.get('Message')}")
+            return []
+
+        results = []
+        for item in (data.get("Result") or {}).get("WebResults") or []:
+            results.append({
+                "title": item.get("Title", ""),
+                "url": item.get("Url", ""),
+                "site": item.get("SiteName", ""),
+                "auth": item.get("AuthInfoDes", ""),
+                "summary": item.get("Summary", ""),
+                "publish_time": item.get("PublishTime", ""),
+            })
+        return results
+
+    except Exception as e:
+        log(f"  Search failed: {e}")
+        return []
+
+
+def _parse_publish_time(s):
+    """解析搜索结果的 PublishTime（ISO 8601，如 2026-09-07T00:00:00+08:00），转本地 naive 时间。"""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+def search_all_categories(api_key):
+    """搜索所有 5 个板块，返回 {category_key: [results]}。带 PublishTime 且超过 7 天的结果被丢弃，无日期的保留。"""
+    now = datetime.now()
+    all_results = {}
+    dropped_stale = 0
+    for cat_key, cat_info in CATEGORIES.items():
+        header = cat_info["header"]
+        log(f"  Searching {header}...")
+        cat_results = []
+        seen_urls = set()
+
+        for query in cat_info["queries"]:
+            results = search_web(query, api_key, count=5, time_range="OneWeek")
+            for r in results:
+                url = r.get("url", "")
+                if not url or url in seen_urls:
+                    continue
+                pt = _parse_publish_time(r.get("publish_time", ""))
+                if pt is not None and (now - pt).total_seconds() / 86400 > 7:
+                    dropped_stale += 1
+                    continue  # 丢弃发布超过 7 天的陈旧结果
+                seen_urls.add(url)
+                cat_results.append(r)
+            time.sleep(0.3)  # 避免触发限流
+
+        all_results[cat_key] = cat_results
+        log(f"    {header}: {len(cat_results)} unique results")
+
+    if dropped_stale:
+        log(f"  Filtered out {dropped_stale} stale results (>7 days)")
+    return all_results
+
+
+# ============================================================
+# Step B: 火山方舟 GLM API 生成摘要
+# ============================================================
+
+def format_search_context(search_results):
+    """将搜索结果格式化为 prompt context。"""
+    parts = []
+    for cat_key, cat_info in CATEGORIES.items():
+        header = cat_info["header"]
+        results = search_results.get(cat_key, [])
+        parts.append(f"\n{'='*60}")
+        parts.append(f"【{header}】搜索结果 ({len(results)} 条)")
+        parts.append(f"{'='*60}")
+        for i, r in enumerate(results[:10], 1):  # 每板块最多 10 条
+            parts.append(f"\n[{i}] {r['title']}")
+            parts.append(f"    发布时间: {r.get('publish_time', '未知')}  |  来源: {r['site']}  |  权威: {r.get('auth', '未知')}")
+            parts.append(f"    URL: {r['url']}")
+            parts.append(f"    摘要: {r['summary'][:500]}")
+    return "\n".join(parts)
+
+
+def build_prompt(search_results, date_str):
+    """构建发送给方舟 GLM API 的完整 prompt。"""
+    context = format_search_context(search_results)
+    week_ago = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    prompt = f"""今天是{date_str}。以下是搜索引擎返回的各大券商最新大宗商品研报信息：
+
+{context}
+
+请基于以上搜索结果，完成以下任务：
+
+一、研报筛选
+从搜索结果中为以下5个板块各选取2篇最有价值的研报（共10篇）。优先选取中金公司、紫金资产、东方财富的研报。
+⚠️ 时效铁律：只能选取发布时间在 {week_ago} 至 {date_str} 之间的研报；每篇研报的 date 字段必须取自搜索结果中标注的发布时间，禁止编造或推断。发布时间不在该窗口内的搜索结果一律不选。如果某板块符合时效要求的研报不足 2 篇，少于的部分才允许用你的知识补充，且标题前必须加"【补充】"标注。
+1. 煤炭板块（动力煤、焦煤、焦炭）
+2. 石油原油板块（布伦特、WTI、国内原油）
+3. 有色金属板块（铜、铝、锌、镍等）
+4. 农产品板块（大豆、玉米、棕榈油等）
+5. 贵金属板块（黄金、白银）
+
+二、撰写详细摘要
+每篇研报写800-1000字中文详细摘要，必须涵盖：
+- 核心观点/评级
+- 具体价格数据和变动幅度
+- 供需分析要点
+- 库存/产能/开工率等关键指标
+- 机构推荐的标的和理由
+- 短期展望和风险提示
+
+三、生成播客脚本
+生成完整播客脚本(full_script)，包含：
+- 开场白："各位听众好，欢迎收听本周的大宗商品研究周报播客。我是豆豆爸。"
+- 每个板块一段，包含研报标题、来源机构和日期
+- 每篇研报的摘要内容与第二步的详细摘要完全一致，不允许缩短或口语化压缩
+- 结束语："以上就是本周的大宗商品研究摘要。感谢收听，我们下周再见。"
+
+四、输出 JSON
+用 ```json``` 代码块包裹完整的 JSON 对象，格式如下：
+{{
+  "date": "{date_str}",
+  "full_script": "完整播客脚本全文",
+  "categories": {{
+    "coal": {{
+      "header": "煤炭板块",
+      "reports": [
+        {{"title": "研报标题", "source": "机构名", "date": "YYYY-MM-DD", "summary": "800-1000字详细摘要"}},
+        {{"title": "...", "source": "...", "date": "...", "summary": "..."}}
+      ]
+    }},
+    "oil": {{"header": "石油原油板块", "reports": [...]}},
+    "nonferrous": {{"header": "有色金属板块", "reports": [...]}},
+    "agriculture": {{"header": "农产品板块", "reports": [...]}},
+    "precious": {{"header": "贵金属板块", "reports": [...]}}
+  }},
+  "sections": [
+    {{"title": "研报标题", "source_org": "机构名", "date": "YYYY-MM-DD", "summary": "简短摘要(100-200字)"}},
+    ...
+  ]
+}}
+
+⚠️ 重要注意事项：
+- JSON 中字符串值如果包含引号，必须使用中文引号（""）而不是 ASCII 双引号（""），否则 JSON 格式会损坏
+- 每篇 summary 必须是 800-1000 字的中文详细摘要，不要缩短
+- full_script 中的摘要内容与 categories 中各 report 的 summary 完全一致
+- sections 中的 summary 是简短版本(100-200字)，不同于 categories 中的详细摘要
+- 输出只需包含 ```json``` 代码块，不要额外的解释文字"""
+
+    return prompt
+
+
+def call_glm(prompt, api_key):
+    """调用火山方舟套餐端点 OpenAI-compatible Chat API（glm-5.3-flash）。
+
+    注意：VOLC_API_KEY 是套餐(plan)key，只能走 /api/plan/v3，按量端点 /api/v3 会 401。
+    glm-5.3-flash 是推理模型，思考内容在 reasoning_content，最终回答在 content。
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": ARK_MODEL,
+        "max_tokens": 65000,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    log(f"  Calling Ark API ({ARK_MODEL}, max_tokens=65000)...")
+    t0 = time.time()
+
+    try:
+        r = httpx.post(ARK_API_URL, json=body, headers=headers, timeout=600)
+        elapsed = time.time() - t0
+
+        if r.status_code != 200:
+            log(f"  API error: HTTP {r.status_code}")
+            log(f"  Response: {r.text[:500]}")
+            return None
+
+        resp = r.json()
+        usage = resp.get("usage", {})
+        choice = (resp.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        log(f"  OK: finish_reason={choice.get('finish_reason')}, "
+            f"prompt_tokens={usage.get('prompt_tokens')}, "
+            f"completion_tokens={usage.get('completion_tokens')}, "
+            f"elapsed={elapsed:.0f}s")
+
+        return message.get("content") or None
+
+    except httpx.TimeoutException:
+        log(f"  API timeout after {time.time()-t0:.0f}s")
+        return None
+    except Exception as e:
+        log(f"  API call failed: {e}")
+        return None
+
+
+# ============================================================
+# Step C: JSON 提取与保存
+# ============================================================
+
+def extract_json(text):
+    """从模型输出中提取 JSON 字符串。"""
+    import re
+
+    # 优先找 ```json ... ``` 代码块
+    match = re.search(r"```json\s*\n?(.*?)\n?```", text, re.DOTALL)
+    if match:
+        log("  Found JSON in ```json``` block")
+        return match.group(1).strip()
+
+    # 回退：找第一个 { 到最后一个 }
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        log("  Extracted JSON by brace matching")
+        return text[start:end + 1]
+
+    return text
+
+
+def repair_json(filepath):
+    """修复 JSON 文件中未转义的 ASCII 双引号，并写回。"""
+    with open(filepath, "r", encoding="utf-8") as f:
+        raw = f.read()
+
+    # 第一轮：尝试直接解析
+    try:
+        json.loads(raw)
+        log("  JSON valid, no repair needed")
+        return True
+    except json.JSONDecodeError as e:
+        log(f"  JSON parse error: {e}")
+
+    # 第二轮：字符级修复
+    log("  Attempting JSON repair...")
+    result = []
+    in_string = False
+    escaped = False
+    fixed = 0
+
+    for i, ch in enumerate(raw):
+        if escaped:
+            result.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            result.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            if in_string:
+                rest = raw[i + 1:]
+                stripped = rest.lstrip()
+                if stripped and stripped[0] in ",:}]":
+                    in_string = False
+                    result.append(ch)
+                else:
+                    result.append('\\"')
+                    fixed += 1
+            else:
+                in_string = True
+                result.append(ch)
+        else:
+            result.append(ch)
+
+    repaired = "".join(result)
+    log(f"  Fixed {fixed} unescaped quotes")
+
+    # 第三轮：验证
+    try:
+        json.loads(repaired)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(repaired)
+        log("  JSON repair successful, written back")
+        return True
+    except json.JSONDecodeError as e:
+        log(f"  Repair still invalid: {e}")
+        backup = filepath + ".broken"
+        with open(backup, "w", encoding="utf-8") as f:
+            f.write(repaired)
+        log(f"  Saved broken version to {backup}")
+        return False
+
+
+def audit_freshness(data, date_str):
+    """校验研报发布日期是否在执行日前 7 天内，超期/缺失的打日志告警。"""
+    reports = []
+    for cat_key, cat_data in data.get("categories", {}).items():
+        for r in cat_data.get("reports", []):
+            reports.append((cat_key, r))
+
+    run_date = datetime.strptime(date_str, "%Y-%m-%d")
+    stale, nodate = [], 0
+    for cat_key, r in reports:
+        d = (r.get("date") or "").strip()
+        try:
+            age = (run_date - datetime.strptime(d, "%Y-%m-%d")).days
+        except ValueError:
+            nodate += 1
+            continue
+        if age > 7:
+            stale.append(f"[{cat_key}] {r.get('title', '')[:40]} (date={d}, {age}天前)")
+
+    log(f"  时效校验: 共 {len(reports)} 篇, {len(reports) - len(stale) - nodate} 篇在 7 天内, "
+        f"{len(stale)} 篇超期, {nodate} 篇缺/坏日期")
+    for s in stale:
+        log(f"    ⚠ 超期: {s}")
+    if nodate:
+        log(f"    ⚠ {nodate} 篇研报 date 字段缺失或格式非法")
+
+
+def save_json(json_str, date_str):
+    """保存 summaries JSON 和 archive JSON。"""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+
+    summary_file = os.path.join(DATA_DIR, f"summaries_{date_str}.json")
+    archive_file = os.path.join(ARCHIVE_DIR, f"reports_{date_str}.json")
+
+    # 先保存原始内容
+    with open(summary_file, "w", encoding="utf-8") as f:
+        f.write(json_str)
+    log(f"  Saved: {summary_file}")
+
+    # 尝试解析并保存 archive
+    try:
+        data = json.loads(json_str)
+        archive_data = {
+            "date": data.get("date", date_str),
+            "categories": data.get("categories", {}),
+        }
+        with open(archive_file, "w", encoding="utf-8") as f:
+            json.dump(archive_data, f, ensure_ascii=False, indent=2)
+        log(f"  Saved: {archive_file}")
+
+        # 打印摘要统计
+        total = sum(
+            len(cat.get("reports", []))
+            for cat in data.get("categories", {}).values()
+        )
+        log(f"  Reports: {total} total")
+        for cat_key, cat_data in data.get("categories", {}).items():
+            for r in cat_data.get("reports", []):
+                slen = len(r.get("summary", ""))
+                status = "✓" if 800 <= slen <= 1100 else f"⚠({slen})"
+                log(f"    {status} [{cat_key}] {r['title'][:40]}... = {slen} chars")
+
+    except json.JSONDecodeError as e:
+        log(f"  Initial parse failed: {e}, will repair...")
+
+    # 修复 JSON
+    if not repair_json(summary_file):
+        return False
+
+    # 修复后重新保存 archive
+    try:
+        with open(summary_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        archive_data = {
+            "date": data.get("date", date_str),
+            "categories": data.get("categories", {}),
+        }
+        with open(archive_file, "w", encoding="utf-8") as f:
+            json.dump(archive_data, f, ensure_ascii=False, indent=2)
+        log(f"  Archive re-saved after repair")
+        audit_freshness(data, date_str)
+    except Exception as e:
+        log(f"  Archive re-save failed: {e}")
+
+    return True
+
+
+# ============================================================
+# 主入口
+# ============================================================
+
+def run(date_str=None):
+    """执行完整流程：搜索 → 摘要 → 保存。返回 (success: bool, summary_file: str)。"""
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+
+    summary_file = os.path.join(DATA_DIR, f"summaries_{date_str}.json")
+
+    log("=" * 50)
+    log("Commodity Research API Researcher - START")
+    log(f"Date: {date_str}")
+    log("=" * 50)
+
+    # 获取 API Key（搜索与方舟 GLM 调用共用同一 VOLC_API_KEY）
+    volc_key = os.environ.get("VOLC_API_KEY", "")
+
+    if not volc_key:
+        log("ERROR: VOLC_API_KEY not set in environment")
+        return False, summary_file
+
+    log(f"VOLC_API_KEY: {volc_key[:15]}...")
+
+    # ── Step A: 搜索 ──
+    log("Step A: Searching research reports via 火山引擎豆包搜索...")
+    try:
+        search_results = search_all_categories(volc_key)
+        total_results = sum(len(v) for v in search_results.values())
+        log(f"  Total: {total_results} search results across 5 categories")
+        if total_results == 0:
+            log("ERROR: No search results found")
+            return False, summary_file
+    except Exception as e:
+        log(f"ERROR: Search failed: {e}")
+        return False, summary_file
+
+    # ── Step B: 方舟 GLM API 摘要 ──
+    log("Step B: Generating summaries via Ark GLM API...")
+    try:
+        prompt = build_prompt(search_results, date_str)
+        log(f"  Prompt length: {len(prompt)} chars")
+        response_text = call_glm(prompt, volc_key)
+        if not response_text:
+            log("ERROR: Empty response from Ark GLM API")
+            return False, summary_file
+        log(f"  Response length: {len(response_text)} chars")
+    except Exception as e:
+        log(f"ERROR: Ark GLM API call failed: {e}")
+        return False, summary_file
+
+    # ── Step C: 提取与保存 JSON ──
+    log("Step C: Extracting and saving JSON...")
+    try:
+        json_str = extract_json(response_text)
+        if not json_str or not json_str.strip():
+            log("ERROR: Failed to extract JSON from response")
+            # 保存原始响应用于调试
+            debug_file = os.path.join(DATA_DIR, f"debug_response_{date_str}.txt")
+            with open(debug_file, "w", encoding="utf-8") as f:
+                f.write(response_text)
+            log(f"  Saved debug response to {debug_file}")
+            return False, summary_file
+
+        if not save_json(json_str, date_str):
+            log("ERROR: JSON save/repair failed")
+            return False, summary_file
+    except Exception as e:
+        log(f"ERROR: JSON extraction/save failed: {e}")
+        return False, summary_file
+
+    log("=" * 50)
+    log("SUCCESS - API Researcher complete")
+    log(f"Summary file: {summary_file}")
+    log("=" * 50)
+    return True, summary_file
+
+
+if __name__ == "__main__":
+    success, _ = run()
+    sys.exit(0 if success else 1)
