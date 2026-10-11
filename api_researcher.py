@@ -7,7 +7,8 @@ Commodity Research API Researcher
           某板块候选不足时用 DuckDuckGo 搜索补充（硬过滤只留真研报；
           2026-10-03 起豆包搜索 key 失效，备用源改为 ddgs 库，Bing 兜底）
   Step B1: 逐板块 MiMo 精选（每板块 1 次小调用，失败降级为规则精选）
-  Step B2: 逐篇 MiMo 摘要（每篇 1 次小调用，失败重试，不足 800 字触发扩写）
+           + 跨板块去重（同一篇研报只归一个板块，被剥夺板块重新精选）
+  Step B2: 逐篇 MiMo 摘要（每篇 1 次小调用，失败重试，不足 300 字触发扩写）
   Step C: 代码拼装 full_script / sections 并保存
 
 架构说明：glm-5.3-flash 是推理模型且 thinking 无法关闭（实测 ark 返回
@@ -64,6 +65,11 @@ EM_CATEGORY_KEYWORDS = {
 _REPORT_SITE_PAT = re.compile(r"hibor\.|迈博汇金|慧博|发现报告|fxbaogao|data\.eastmoney\.com/report", re.I)
 _REPORT_TITLE_PAT = re.compile(r"研报|研究报告|行业周报|行业月报|行业点评|行业深度|行业跟踪|投资策略|专题报告|晨报")
 _NEWS_SITE_PAT = re.compile(r"今日头条|百度|腾讯|网易|新浪|搜狐|雪球|知乎|微信公众号|澎湃|财联社|抖音|同花顺|东方财富|支付宝|百家号")
+# 文档分享/文库类站点：标题常含「研究报告」，但正文是空壳（仅分类标签+导航），非研报来源。
+# 2026-10-11 期煤炭板块曾误选《煤炭行业研究报告 - 道客巴巴》，其摘要自述「未提供实质性正文」。
+_JUNK_SITE_PAT = re.compile(
+    r"doc88|道客巴巴|百度文库|wenku\.baidu|豆丁|docin\.|book118|原创力|人人文库|renrendoc"
+    r"|金锄头|熊猫办公|文档下载|文档分享|文档网|爱问共享|csdn下载", re.I)
 
 # 单次调用参数：小任务量 + 流式，避免非流式长连接超时
 # ⚠️ glm-5.3-flash 是推理模型，max_tokens 是 thinking + 回答共享预算：
@@ -349,10 +355,16 @@ def _fetch_report_abstract(info_code, cache):
 
 
 def _is_report_result(r):
-    """豆包补充源硬过滤：只放行真研报（站点白名单命中，或非新闻站点且标题含研报特征词）。"""
-    text = (r.get("title") or "") + " " + (r.get("url") or "")
+    """豆包补充源硬过滤：只放行真研报（站点白名单命中，或非新闻站点且标题含研报特征词）。
+
+    文档分享/文库类站点（道客巴巴、百度文库等）一律拒绝：标题虽含「研究报告」，
+    正文却多为空壳，摘要只能泛泛而谈。
+    """
+    text = (r.get("title") or "") + " " + (r.get("url") or "") + " " + (r.get("site") or "")
     if _REPORT_SITE_PAT.search(text):
         return True
+    if _JUNK_SITE_PAT.search(text):
+        return False
     if _NEWS_SITE_PAT.search(r.get("site") or ""):
         return False
     return bool(_REPORT_TITLE_PAT.search(r.get("title") or ""))
@@ -646,15 +658,21 @@ def _heuristic_select(cat_key, candidates, pick=2):
     return picked
 
 
-def select_reports(cat_key, cat_info, search_results, api_key):
-    """单板块精选 2 篇。LLM 精选失败时降级为规则精选。返回选中的候选列表。"""
+def select_reports(cat_key, cat_info, search_results, api_key, exclude_titles=None):
+    """单板块精选 2 篇。LLM 精选失败时降级为规则精选。返回选中的候选列表。
+
+    exclude_titles: 跨板块去重时已被其他板块占用的标题，从候选中剔除，
+    避免同一篇研报被两个板块重复选用。
+    """
     header = cat_info["header"]
-    if not search_results:
+    exclude_titles = exclude_titles or set()
+    pool = [r for r in search_results if r.get("title") not in exclude_titles]
+    if not pool:
         log(f"  [{cat_key}] 无候选结果，跳过")
         return []
 
     candidates = []
-    for i, r in enumerate(search_results[:10], 1):  # 每板块最多取 10 条候选
+    for i, r in enumerate(pool[:10], 1):  # 每板块最多取 10 条候选
         c = dict(r)
         c["index"] = i
         candidates.append(c)
@@ -699,6 +717,74 @@ def select_reports(cat_key, cat_info, search_results, api_key):
     return picked
 
 
+def _report_owner_category(report):
+    """判断一篇研报最应归属的板块：其东财 industryName 命中哪个板块的行业词。
+
+    东财行业词在板块间互斥（工业金属/能源金属/小金属 ↔ 贵金属 ↔ 煤炭/焦炭 …），
+    故至多命中一个板块，返回该板块 key；无行业分类（策略报告、Bing 源）返回 None。
+    典型场景：《有色金属行业点评报告：…贵金属迎喘息窗口》标题含「有色金属」，
+    但 industryName=贵金属，应归贵金属板块而非有色板块。
+    """
+    industry = report.get("industry") or ""
+    if not industry:
+        return None
+    for cat_key in CATEGORIES:
+        if any(k in industry for k in EM_CATEGORY_KEYWORDS.get(cat_key, {}).get("industry", [])):
+            return cat_key
+    return None
+
+
+def _dedup_cross_category(selected, search_results, llm_key):
+    """跨板块去重：同一篇研报（按标题）只能出现在一个板块。
+
+    各板块精选相互独立，而一篇研报可同时命中多个板块的归类关键词（标题/行业词），
+    因此需要全局归并。归属规则：industryName 命中的板块优先（更贴题），
+    否则按 CATEGORIES 顺序先到先得。被剥夺的板块带「排除已占标题」约束重新精选补足。
+    """
+    holders = {}  # title -> [(cat_key, report), ...]
+    for cat_key, reports in selected.items():
+        for r in reports:
+            holders.setdefault(r["title"], []).append((cat_key, r))
+
+    drop = {}  # cat_key -> set(title)
+    for title, hs in holders.items():
+        if len(hs) < 2:
+            continue
+        holder_cats = [c for c, _ in hs]
+        owner = _report_owner_category(hs[0][1])
+        keep_cat = owner if owner in holder_cats else holder_cats[0]
+        for cat_key, _ in hs:
+            if cat_key != keep_cat:
+                drop.setdefault(cat_key, set()).add(title)
+        losers = [CATEGORIES[c]["header"] for c in holder_cats if c != keep_cat]
+        log(f"  ⚠ 跨板块重复研报《{title[:32]}》→ 归属[{CATEGORIES[keep_cat]['header']}]，"
+            f"{losers} 重新精选")
+
+    if not drop:
+        return selected
+
+    taken = {r["title"] for reports in selected.values() for r in reports}
+    for cat_key in CATEGORIES:  # 按固定顺序补选，保证确定性
+        victims = drop.get(cat_key)
+        if not victims:
+            continue
+        kept = [r for r in selected[cat_key] if r["title"] not in victims]
+        have = {r["title"] for r in kept}
+        exclude = taken - have  # 其他板块已占用的标题，本板块不得再选
+        refill = select_reports(cat_key, CATEGORIES[cat_key],
+                                search_results.get(cat_key, []), llm_key,
+                                exclude_titles=exclude)
+        for r in refill:
+            if r["title"] not in have:
+                kept.append(r)
+                have.add(r["title"])
+            if len(kept) >= 2:
+                break
+        selected[cat_key] = kept
+        taken = {r["title"] for reports in selected.values() for r in reports}
+    return selected
+
+
 # ============================================================
 # Step B2: 逐篇摘要
 # ============================================================
@@ -716,11 +802,11 @@ def build_summary_prompt(cat_info, report):
 
 请输出 JSON（用 ```json``` 包裹）：
 {{
-  "detailed_summary": "800-1000字的中文详细摘要",
+  "detailed_summary": "300-500字的中文详细摘要",
   "short_summary": "100-200字的中文简短摘要"
 }}
 
-详细摘要必须涵盖（材料中有则写，没有的方面可省略）：
+详细摘要篇幅有限，按重要性择要涵盖（材料中有则写，没有的方面可省略，不要面面俱到）：
 - 核心观点/评级
 - 具体价格数据和变动幅度
 - 供需分析要点
@@ -734,23 +820,23 @@ def build_summary_prompt(cat_info, report):
 
 
 def _expand_summary(cat_info, report, current, api_key):
-    """摘要不足 800 字时的扩写调用。"""
+    """摘要不足 300 字时的扩写调用。"""
     prompt = f"""以下是研报《{report['title']}》（{cat_info['header']}，来源：{report['site']}）的摘要初稿：
 
 {current}
 
-该初稿不足 800 字。请在保持原有事实和数字完全不变的前提下扩写到 800-1000 字，
+该初稿不足 300 字。请在保持原有事实和数字完全不变的前提下扩写到 300-500 字，
 补充供需背景、行业逻辑、板块影响等定性分析。
 
 输出 JSON（用 ```json``` 包裹）：
-{{"detailed_summary": "扩写后的 800-1000 字摘要"}}
+{{"detailed_summary": "扩写后的 300-500 字摘要"}}
 
 JSON 字符串内不得使用未转义的 ASCII 双引号，请用中文引号（""）。只输出 JSON。"""
     content = call_glm(prompt, api_key, CALL_MAX_TOKENS_SUMMARY, tag=f"expand")
     if not content:
         return None
     data = parse_llm_json(content)
-    if data and len(data.get("detailed_summary", "")) >= 800:
+    if data and len(data.get("detailed_summary", "")) >= 300:
         return data["detailed_summary"]
     return None
 
@@ -767,7 +853,7 @@ def summarize_report(cat_key, cat_info, report, api_key):
     detailed = data["detailed_summary"].strip()
     short = (data.get("short_summary") or "").strip()
 
-    if len(detailed) < 800:
+    if len(detailed) < 300:
         log(f"    ⚠ [{cat_key}] 摘要仅 {len(detailed)} 字，触发扩写")
         expanded = _expand_summary(cat_info, report, detailed, api_key)
         if expanded:
@@ -917,6 +1003,10 @@ def run(date_str=None):
     selected = {}  # cat_key -> [candidate dicts]
     for cat_key, cat_info in CATEGORIES.items():
         selected[cat_key] = select_reports(cat_key, cat_info, search_results.get(cat_key, []), llm_key)
+
+    # 跨板块去重：一篇研报可同时命中多个板块的归类词，需全局归并，避免同一篇研报
+    # 出现在两个板块（如 2026-10-11 期「有色金属…贵金属迎喘息窗口」同时进了有色/贵金属）
+    selected = _dedup_cross_category(selected, search_results, llm_key)
 
     total_selected = sum(len(v) for v in selected.values())
     log(f"  Selected {total_selected} reports total")
